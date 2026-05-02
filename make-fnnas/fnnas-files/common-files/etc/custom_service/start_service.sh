@@ -12,16 +12,18 @@
 # Dependent: /etc/rc.local
 # Location: /etc/custom_service/start_service.sh
 #
-# Version: v1.1
+# Version: v1.2
 #
 #========================================================================================
+
+set +e
 
 # Custom service log - all script output will be logged here.
 custom_log="/tmp/ophub_start_service.log"
 
 # A helper function for logging with timestamp.
 log_message() {
-    echo "[$(date +"%Y.%m.%d.%H:%M:%S")] $1" >>"${custom_log}"
+    echo "[$(date +"%Y.%m.%d.%H:%M:%S")] $1" >>"${custom_log}" 2>/dev/null || true
 }
 
 # Start of the script.
@@ -159,20 +161,49 @@ fi
 # Add HDMI video mode parameter to GRUB configuration if not already present
 fnnas_grub_file="/etc/default/grub"
 fnnas_add_param="video=HDMI-A-1:1920x1080@60e"
-[[ -f "${fnnas_grub_file}" ]] && {
+fnnas_grub_done="/etc/custom_service/.grub_hdmi_patched"
+[[ -f "${fnnas_grub_file}" && ! -f "${fnnas_grub_done}" ]] && {
+    # Helper: mark the task as finished (idempotent, never fatal).
+    _mark_grub_done() { : >"${fnnas_grub_done}" 2>/dev/null || true; }
+    # Helper: restore the original /etc/default/grub from backup if available.
+    _restore_grub_file() {
+        [[ -f "${fnnas_grub_file}.bak" ]] && cp -f "${fnnas_grub_file}.bak" "${fnnas_grub_file}" 2>/dev/null || true
+    }
+
     if grep "^GRUB_CMDLINE_LINUX_DEFAULT" "${fnnas_grub_file}" | grep -q "video=HDMI"; then
-        log_message "HDMI video parameter already present in GRUB configuration."
+        # Parameter already present in /etc/default/grub. Make sure the
+        # generated grub.cfg actually reflects it before declaring victory,
+        # otherwise an interrupted previous run could leave them out of sync.
+        if /usr/sbin/update-grub >/dev/null 2>&1; then
+            _mark_grub_done
+            log_message "HDMI video parameter already present; grub.cfg refreshed."
+        else
+            log_message "HDMI video parameter present but update-grub failed; will retry next boot."
+        fi
     else
         log_message "Adding HDMI video parameter to GRUB configuration."
-        # Backup the original GRUB configuration
-        cp "${fnnas_grub_file}" "${fnnas_grub_file}.bak"
-        # Append the HDMI video parameter
-        sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\".*\)\"$/\1 ${fnnas_add_param}\"/" "${fnnas_grub_file}"
-        # Update GRUB in the background
-        /usr/sbin/update-grub >/dev/null 2>&1 &
-        log_message "GRUB configuration updated."
+        # Keep the very first backup; do not overwrite it on subsequent runs.
+        [[ -f "${fnnas_grub_file}.bak" ]] || cp "${fnnas_grub_file}" "${fnnas_grub_file}.bak" 2>/dev/null
+        # Patch the file, then verify the change took effect.
+        if sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\".*\)\"$/\1 ${fnnas_add_param}\"/" "${fnnas_grub_file}" 2>/dev/null &&
+            grep "^GRUB_CMDLINE_LINUX_DEFAULT" "${fnnas_grub_file}" | grep -q "video=HDMI"; then
+            # Run update-grub synchronously so we know whether grub.cfg got
+            # written before we mark the task as done.
+            if /usr/sbin/update-grub >/dev/null 2>&1; then
+                _mark_grub_done
+                log_message "GRUB configuration updated."
+            else
+                _restore_grub_file
+                log_message "update-grub failed, /etc/default/grub restored from backup."
+            fi
+        else
+            _restore_grub_file
+            log_message "sed failed to patch GRUB, original file restored."
+        fi
     fi
-}
+    unset -f _mark_grub_done _restore_grub_file
+} || true
 
 # Finalization
 log_message "All custom services processed."
+exit 0
